@@ -22,7 +22,7 @@ use quote::{quote, ToTokens};
 use std::{
     collections::HashMap,
     fmt::{self, Display},
-    iter::{self, once, repeat},
+    iter::{self, once, repeat, repeat_n},
 };
 use syn::{
     punctuated::Punctuated, token::Comma, DeriveInput, Field, Fields, Generics, Ident, Member,
@@ -31,7 +31,7 @@ use syn::{
 };
 
 /// Derives `Sequence`.
-#[proc_macro_derive(Sequence)]
+#[proc_macro_derive(Sequence, attributes(enum_iterator))]
 pub fn derive_sequence(input: proc_macro::TokenStream) -> proc_macro::TokenStream {
     derive(input)
         .unwrap_or_else(|e| e.to_compile_error())
@@ -42,26 +42,69 @@ fn derive(input: proc_macro::TokenStream) -> Result<TokenStream, syn::Error> {
     derive_for_ast(syn::parse(input)?)
 }
 
+#[derive(Debug)]
+struct DeriveOptions {
+    crate_path: Path,
+}
+
+impl DeriveOptions {
+    fn parse(attrs: &[syn::Attribute]) -> Result<Self, syn::Error> {
+        let mut crate_path = None;
+        attrs
+            .iter()
+            .filter(|attr| attr.path().is_ident("enum_iterator"))
+            .try_for_each(|attr| {
+                attr.parse_nested_meta(|meta| {
+                    if meta.path.is_ident("crate") {
+                        let path: Path = meta.value()?.parse()?;
+                        if crate_path.is_none() {
+                            crate_path = Some(path);
+                            Ok(())
+                        } else {
+                            Err(meta.error("duplicate crate key"))
+                        }
+                    } else {
+                        Err(meta.error(format!("unknown key {}", meta.path.to_token_stream())))
+                    }
+                })
+            })?;
+        Ok(Self {
+            crate_path: crate_path.unwrap_or_else(|| Path {
+                leading_colon: Some(Default::default()),
+                segments: [PathSegment::from(Ident::new(
+                    "enum_iterator",
+                    Span::call_site(),
+                ))]
+                .into_iter()
+                .collect(),
+            }),
+        })
+    }
+}
+
 fn derive_for_ast(ast: DeriveInput) -> Result<TokenStream, syn::Error> {
     let ty = &ast.ident;
     let generics = &ast.generics;
+    let options = DeriveOptions::parse(&ast.attrs)?;
     match &ast.data {
-        syn::Data::Struct(s) => derive_for_struct(ty, generics, &s.fields),
-        syn::Data::Enum(e) => derive_for_enum(ty, generics, &e.variants),
+        syn::Data::Struct(s) => derive_for_struct(&options, ty, generics, &s.fields),
+        syn::Data::Enum(e) => derive_for_enum(&options, ty, generics, &e.variants),
         syn::Data::Union(_) => Err(Error::UnsupportedUnion.with_tokens(&ast)),
     }
 }
 
 fn derive_for_struct(
+    options: &DeriveOptions,
     ty: &Ident,
     generics: &Generics,
     fields: &Fields,
 ) -> Result<TokenStream, syn::Error> {
-    let cardinality = tuple_cardinality(fields);
-    let first = init_value(ty, None, fields, Direction::Forward);
-    let last = init_value(ty, None, fields, Direction::Backward);
-    let next_body = advance_struct(ty, fields, Direction::Forward);
-    let previous_body = advance_struct(ty, fields, Direction::Backward);
+    let crate_path = &options.crate_path;
+    let cardinality = tuple_cardinality(&options.crate_path, fields);
+    let first = init_value(&options.crate_path, ty, None, fields, Direction::Forward);
+    let last = init_value(&options.crate_path, ty, None, fields, Direction::Backward);
+    let next_body = advance_struct(&options.crate_path, ty, fields, Direction::Forward);
+    let previous_body = advance_struct(&options.crate_path, ty, fields, Direction::Backward);
     let (impl_generics, ty_generics, where_clause) = generics.split_for_impl();
     let where_clause = if generics.params.is_empty() {
         where_clause.cloned()
@@ -71,15 +114,16 @@ fn derive_for_struct(
             predicates: Default::default(),
         });
         clause.predicates.extend(
-            trait_bounds(group_type_requirements(
-                fields.iter().rev().zip(tuple_type_requirements()),
-            ))
+            trait_bounds(
+                &options.crate_path,
+                group_type_requirements(fields.iter().rev().zip(tuple_type_requirements())),
+            )
             .map(WherePredicate::Type),
         );
         Some(clause)
     };
     let tokens = quote! {
-        impl #impl_generics ::enum_iterator::Sequence for #ty #ty_generics #where_clause {
+        impl #impl_generics #crate_path::Sequence for #ty #ty_generics #where_clause {
             #[allow(clippy::identity_op)]
             const CARDINALITY: usize = #cardinality;
 
@@ -104,13 +148,14 @@ fn derive_for_struct(
 }
 
 fn derive_for_enum(
+    options: &DeriveOptions,
     ty: &Ident,
     generics: &Generics,
     variants: &Punctuated<Variant, Comma>,
 ) -> Result<TokenStream, syn::Error> {
-    let cardinality = enum_cardinality(variants);
-    let next_body = advance_enum(ty, variants, Direction::Forward);
-    let previous_body = advance_enum(ty, variants, Direction::Backward);
+    let cardinality = enum_cardinality(&options.crate_path, variants);
+    let next_body = advance_enum(&options.crate_path, ty, variants, Direction::Forward);
+    let previous_body = advance_enum(&options.crate_path, ty, variants, Direction::Backward);
     let (impl_generics, ty_generics, where_clause) = generics.split_for_impl();
     let where_clause = if generics.params.is_empty() {
         where_clause.cloned()
@@ -120,15 +165,19 @@ fn derive_for_enum(
             predicates: Default::default(),
         });
         clause.predicates.extend(
-            trait_bounds(group_type_requirements(variants.iter().flat_map(
-                |variant| variant.fields.iter().rev().zip(tuple_type_requirements()),
-            )))
+            trait_bounds(
+                &options.crate_path,
+                group_type_requirements(variants.iter().flat_map(|variant| {
+                    variant.fields.iter().rev().zip(tuple_type_requirements())
+                })),
+            )
             .map(WherePredicate::Type),
         );
         Some(clause)
     };
-    let next_variant_body = next_variant(ty, variants, Direction::Forward);
-    let previous_variant_body = next_variant(ty, variants, Direction::Backward);
+    let next_variant_body = next_variant(&options.crate_path, ty, variants, Direction::Forward);
+    let previous_variant_body =
+        next_variant(&options.crate_path, ty, variants, Direction::Backward);
     let (first, last) = if variants.is_empty() {
         (
             quote! { ::core::option::Option::None },
@@ -141,8 +190,9 @@ fn derive_for_enum(
             quote! { previous_variant(#last_index) },
         )
     };
+    let crate_path = &options.crate_path;
     let tokens = quote! {
-        impl #impl_generics ::enum_iterator::Sequence for #ty #ty_generics #where_clause {
+        impl #impl_generics #crate_path::Sequence for #ty #ty_generics #where_clause {
             #[allow(clippy::identity_op)]
             const CARDINALITY: usize = #cardinality;
 
@@ -181,20 +231,20 @@ fn derive_for_enum(
     Ok(tokens)
 }
 
-fn enum_cardinality(variants: &Punctuated<Variant, Comma>) -> TokenStream {
+fn enum_cardinality(crate_path: &Path, variants: &Punctuated<Variant, Comma>) -> TokenStream {
     let terms = variants
         .iter()
-        .map(|variant| tuple_cardinality(&variant.fields));
+        .map(|variant| tuple_cardinality(crate_path, &variant.fields));
     quote! {
         #((#terms) +)* 0
     }
 }
 
-fn tuple_cardinality(fields: &Fields) -> TokenStream {
+fn tuple_cardinality(crate_path: &Path, fields: &Fields) -> TokenStream {
     let factors = fields.iter().map(|field| {
         let ty = &field.ty;
         quote! {
-            <#ty as ::enum_iterator::Sequence>::CARDINALITY
+            <#ty as #crate_path::Sequence>::CARDINALITY
         }
     });
     quote! {
@@ -210,6 +260,7 @@ fn field_id(field: &Field, index: usize) -> Member {
 }
 
 fn init_value(
+    crate_path: &Path,
     ty: &Ident,
     variant: Option<&Ident>,
     fields: &Fields,
@@ -222,8 +273,7 @@ fn init_value(
         }
     } else {
         let reset = direction.reset();
-        let initialization =
-            repeat(quote! { ::enum_iterator::Sequence::#reset() }).take(fields.len());
+        let initialization = repeat_n(quote! { #crate_path::Sequence::#reset() }, fields.len());
         let assignments = field_assignments(fields);
         let bindings = bindings().take(fields.len());
         quote! {{
@@ -238,6 +288,7 @@ fn init_value(
 }
 
 fn next_variant(
+    crate_path: &Path,
     ty: &Ident,
     variants: &Punctuated<Variant, Comma>,
     direction: Direction,
@@ -255,7 +306,7 @@ fn next_variant(
     };
     let arms = variants.iter().enumerate().map(|(i, v)| {
         let id = &v.ident;
-        let init = init_value(ty, Some(id), &v.fields, direction);
+        let init = init_value(crate_path, ty, Some(id), &v.fields, direction);
         quote! {
             #i => #init
         }
@@ -274,10 +325,15 @@ fn next_variant(
     }
 }
 
-fn advance_struct(ty: &Ident, fields: &Fields, direction: Direction) -> TokenStream {
+fn advance_struct(
+    crate_path: &Path,
+    ty: &Ident,
+    fields: &Fields,
+    direction: Direction,
+) -> TokenStream {
     let assignments = field_assignments(fields);
     let bindings = bindings().take(fields.len()).collect::<Vec<_>>();
-    let tuple = advance_tuple(&bindings, direction);
+    let tuple = advance_tuple(crate_path, &bindings, direction);
     quote! {
         let #ty { #assignments } = self;
         let (#(#bindings,)*) = #tuple?;
@@ -286,6 +342,7 @@ fn advance_struct(ty: &Ident, fields: &Fields, direction: Direction) -> TokenStr
 }
 
 fn advance_enum(
+    crate_path: &Path,
     ty: &Ident,
     variants: &Punctuated<Variant, Comma>,
     direction: Direction,
@@ -294,13 +351,13 @@ fn advance_enum(
         Direction::Forward => variants
             .iter()
             .enumerate()
-            .map(|(i, variant)| advance_enum_arm(ty, direction, i, variant))
+            .map(|(i, variant)| advance_enum_arm(crate_path, ty, direction, i, variant))
             .collect(),
         Direction::Backward => variants
             .iter()
             .enumerate()
             .rev()
-            .map(|(i, variant)| advance_enum_arm(ty, direction, i, variant))
+            .map(|(i, variant)| advance_enum_arm(crate_path, ty, direction, i, variant))
             .collect(),
     };
     quote! {
@@ -310,7 +367,13 @@ fn advance_enum(
     }
 }
 
-fn advance_enum_arm(ty: &Ident, direction: Direction, i: usize, variant: &Variant) -> TokenStream {
+fn advance_enum_arm(
+    crate_path: &Path,
+    ty: &Ident,
+    direction: Direction,
+    i: usize,
+    variant: &Variant,
+) -> TokenStream {
     let next = match direction {
         Direction::Forward => match i.checked_add(1) {
             Some(next_i) => quote! { next_variant(#next_i) },
@@ -330,7 +393,7 @@ fn advance_enum_arm(ty: &Ident, direction: Direction, i: usize, variant: &Varian
         let destructuring = field_bindings(&variant.fields);
         let assignments = field_assignments(&variant.fields);
         let bindings = bindings().take(variant.fields.len()).collect::<Vec<_>>();
-        let tuple = advance_tuple(&bindings, direction);
+        let tuple = advance_tuple(crate_path, &bindings, direction);
         quote! {
             #ty::#id { #destructuring } => {
                 let y = #tuple;
@@ -345,7 +408,7 @@ fn advance_enum_arm(ty: &Ident, direction: Direction, i: usize, variant: &Varian
     }
 }
 
-fn advance_tuple(bindings: &[Ident], direction: Direction) -> TokenStream {
+fn advance_tuple(crate_path: &Path, bindings: &[Ident], direction: Direction) -> TokenStream {
     let advance = direction.advance();
     let reset = direction.reset();
     let rev_bindings = bindings.iter().rev().collect::<Vec<_>>();
@@ -355,9 +418,9 @@ fn advance_tuple(bindings: &[Ident], direction: Direction) -> TokenStream {
     };
     let rev_binding_head = match rev_binding_head {
         Some(head) => quote! {
-            let (#head, carry) = match ::enum_iterator::Sequence::#advance(#head) {
+            let (#head, carry) = match #crate_path::Sequence::#advance(#head) {
                 ::core::option::Option::Some(#head) => (::core::option::Option::Some(#head), false),
-                ::core::option::Option::None => (::enum_iterator::Sequence::#reset(), true),
+                ::core::option::Option::None => (#crate_path::Sequence::#reset(), true),
             };
         },
         None => quote! {
@@ -368,11 +431,11 @@ fn advance_tuple(bindings: &[Ident], direction: Direction) -> TokenStream {
         #rev_binding_head
         #(
             let (#rev_binding_tail, carry) = if carry {
-                match ::enum_iterator::Sequence::#advance(#rev_binding_tail) {
+                match #crate_path::Sequence::#advance(#rev_binding_tail) {
                     ::core::option::Option::Some(#rev_binding_tail) => {
                         (::core::option::Option::Some(#rev_binding_tail), false)
                     }
-                    ::core::option::Option::None => (::enum_iterator::Sequence::#reset(), true),
+                    ::core::option::Option::None => (#crate_path::Sequence::#reset(), true),
                 }
             } else {
                 (
@@ -431,13 +494,14 @@ fn bindings() -> impl Iterator<Item = Ident> {
     (0..).map(|i| Ident::new(&format!("x{i}"), Span::call_site()))
 }
 
-fn trait_bounds<I>(types: I) -> impl Iterator<Item = PredicateType>
+fn trait_bounds<I>(crate_path: &Path, types: I) -> impl Iterator<Item = PredicateType>
 where
     I: IntoIterator<Item = (Type, TypeRequirements)>,
 {
+    let crate_path = crate_path.clone();
     types
         .into_iter()
-        .map(|(bounded_ty, requirements)| PredicateType {
+        .map(move |(bounded_ty, requirements)| PredicateType {
             lifetimes: None,
             bounded_ty,
             colon_token: Default::default(),
@@ -445,7 +509,7 @@ where
                 .into_iter()
                 .map(|req| match req {
                     TypeRequirement::Clone => clone_trait_path(),
-                    TypeRequirement::Sequence => trait_path(),
+                    TypeRequirement::Sequence => trait_path(&crate_path),
                 })
                 .map(trait_bound)
                 .collect(),
@@ -461,16 +525,11 @@ fn trait_bound(path: Path) -> TypeParamBound {
     })
 }
 
-fn trait_path() -> Path {
-    Path {
-        leading_colon: Some(Default::default()),
-        segments: [
-            PathSegment::from(Ident::new("enum_iterator", Span::call_site())),
-            Ident::new("Sequence", Span::call_site()).into(),
-        ]
-        .into_iter()
-        .collect(),
-    }
+fn trait_path(crate_path: &Path) -> Path {
+    let mut path = crate_path.clone();
+    path.segments
+        .push(Ident::new("Sequence", Span::call_site()).into());
+    path
 }
 
 fn clone_trait_path() -> Path {
@@ -610,5 +669,24 @@ impl Display for Error {
         match self {
             Error::UnsupportedUnion => f.write_str("Sequence cannot be derived for union types"),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use crate::DeriveOptions;
+    use quote::quote;
+
+    #[test]
+    fn crate_path_can_be_parsed() {
+        let input: syn::DeriveInput = syn::parse2(quote! {
+            #[derive(Sequence)]
+            #[enum_iterator(crate = foo::bar)]
+            struct Foo;
+        })
+        .unwrap();
+        let options = DeriveOptions::parse(&input.attrs).unwrap();
+        let expected_path: syn::Path = syn::parse2(quote! { foo::bar }).unwrap();
+        assert_eq!(options.crate_path, expected_path);
     }
 }
