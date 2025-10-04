@@ -73,7 +73,7 @@
 //! ```
 //! #[derive(enum_iterator::Sequence)]
 //! #[enum_iterator(use_default)]
-//! enum Foo;
+//! enum Foo {};
 //! ```
 //!
 //! # Rust version
