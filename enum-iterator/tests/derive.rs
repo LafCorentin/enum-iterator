@@ -181,3 +181,73 @@ fn all_values_of_unit_are_yielded() {
 fn all_values_of_unit_are_yielded_in_reverse() {
     assert_eq!(reverse_all::<Unit>().collect::<Vec<_>>(), vec![Unit]);
 }
+
+#[derive(Debug, PartialEq, Sequence)]
+#[enum_iterator(use_default)]
+enum Id {
+    Number(u32),
+    Alias(String),
+    Name { first: String, last: String },
+    Empty,
+}
+
+#[test]
+fn all_values_of_defaults_are_yielded() {
+    assert_eq!(cardinality::<Id>(), 4);
+    assert_eq!(
+        all::<Id>().collect::<Vec<_>>(),
+        vec![
+            Id::Number(Default::default()),
+            Id::Alias(Default::default()),
+            Id::Name {
+                first: Default::default(),
+                last: Default::default()
+            },
+            Id::Empty,
+        ]
+    );
+}
+
+#[test]
+fn iterate_over_defaults_reverse() {
+    let id = Id::Empty;
+
+    let name = id.previous().unwrap();
+    assert_eq!(
+        name,
+        Id::Name {
+            first: Default::default(),
+            last: Default::default(),
+        }
+    );
+
+    let alias = name.previous().unwrap();
+    assert_eq!(alias, Id::Alias(Default::default()));
+
+    let number = alias.previous().unwrap();
+    assert_eq!(number, Id::Number(Default::default()));
+
+    assert!(number.previous().is_none());
+}
+
+#[test]
+fn iterate_over_defaults() {
+    let id = Id::Number(5);
+
+    let alias = id.next().unwrap();
+    assert_eq!(alias, Id::Alias(Default::default()));
+
+    let name = alias.next().unwrap();
+    assert_eq!(
+        name,
+        Id::Name {
+            first: Default::default(),
+            last: Default::default(),
+        }
+    );
+
+    let empty = name.next().unwrap();
+    assert_eq!(empty, Id::Empty);
+
+    assert!(empty.next().is_none());
+}
