@@ -64,6 +64,17 @@
 //! #[enum_iterator(crate = enum_iterator)]
 //! struct Foo;
 //! ```
+//! 
+//! # Iterate over enum's default variant
+//! 
+//! For enums with only unit variants or variants with fields implementing [`core::default::Default`],
+//! is is possible to iterate over them using the `use_default` parameter.
+//! 
+//! ```
+//! #[derive(enum_iterator::Sequence)]
+//! #[enum_iterator(use_default)]
+//! enum Foo;
+//! ```
 //!
 //! # Rust version
 //! This crate tracks stable Rust. Minor releases may require a newer Rust version. Patch releases

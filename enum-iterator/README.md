@@ -53,6 +53,24 @@ assert_eq!(first::<Foo>(), Some(Foo { a: false, b: 0 }));
 assert_eq!(last::<Foo>(), Some(Foo { a: true, b: 255 }));
 ```
 
+```rust
+use enum_iterator::{Sequence};
+use core::default;
+
+#[derive(Debug, PartialEq, Sequence)]
+#[enum_iterator(use_default)]
+enum Id {
+    Name { first: String, last: String },
+    Empty,
+    Alias(String),
+}
+
+let number = Id::Empty;
+
+assert_eq!(number.next(), Some(Id::Alias(default::Default())));
+assert_eq!(number.previous(), Some(Id::Name {first: default::Default(), last: default::Default()}));
+```
+
 # Rust version
 This crate tracks stable Rust. Minor releases may require a newer Rust version. Patch releases
 must not require a newer Rust version.
